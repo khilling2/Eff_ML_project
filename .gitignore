@@ -3,3 +3,10 @@ pylog124M/
 __pycache__/
 logs/
 .DS_Store
+data_selection_logs/
+MLE_70/
+random_70/
+train_short_fineweb10B/
+metrics/
+torch_elastic_logs
+*.ipynb

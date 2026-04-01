@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+import flash_attn as flash_attn_interface
 from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
@@ -23,6 +24,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import triton
 import numpy as np
+from itertools import cycle
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
@@ -1059,8 +1061,6 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
         super().__init__()
@@ -1348,7 +1348,18 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
+            x_flat = x.view(-1, x.size(-1))
+            logits = x_flat @ self.lm_head.weight
+            A = 23.0
+            B = 5.0
+            C = 7.5
+            logits = A * torch.sigmoid((logits + B) / C)
+            loss_per_token = torch.nn.functional.cross_entropy(
+                logits,
+                target_seq,
+                reduction="none"
+            )
+            loss_per_token = loss_per_token * mtp_weights[torch.arange(loss_per_token.numel(), device=loss_per_token.device) % mtp_weights.numel()]
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1468,7 +1479,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
 
-    file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
+    file_iter = cycle(files)  # Use itertools.cycle(files) for multi-epoch training
     tokens = _load_data_shard(next(file_iter))
     if align_to_bos:
         shard = Shard(tokens, world_size)
@@ -1544,20 +1555,20 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 @dataclass
 class Hyperparameters:
     # data
-    data_path = os.environ.get("DATA_PATH", ".")
-    train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
-    val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
+    train_data_path = os.environ.get("DATA_PATH", "data/fineweb10B")
+    train_files: str = os.path.join(train_data_path, "fineweb_train_*.bin") # input .bin to train on
+    val_files: str = os.path.join("data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 1 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1450  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 780  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 20  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 200  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
-    run_evals: bool = False  # run additional evaluations after training is completed
+    run_evals: bool = True  # run additional evaluations after training is completed
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -1844,13 +1855,27 @@ class TrainingManager():
 
 # begin logging
 logfile = None
+loss_logfile = None
 if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
-def print0(s, console=False):
+    os.makedirs("data_selection_logs", exist_ok=True)
+    loss_logfile = f"data_selection_logs/{os.environ['EXP_NAME']}.txt"
+    bench_logfile = "data_selection_logs/hellaswag.txt"
+    with open(loss_logfile, "x") as f:
+        print("step,val_loss", file=f)
+def print0(s, console=False, loss=False, bench=False):
     if master_process:
+        if loss:
+            with open(loss_logfile, "a") as f:
+                print(s, file=f)
+            return
+        if bench:
+            with open(bench_logfile, "a") as f:
+                print(s, file=f)
+            return
         with open(logfile, "a") as f:
             if console:
                 print(s)
@@ -1888,7 +1913,7 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model) #, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 
@@ -1965,6 +1990,7 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        print0(f"{step},{val_loss:.4f}", loss=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
