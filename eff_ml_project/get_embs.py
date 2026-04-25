@@ -1,21 +1,14 @@
 from pathlib import Path
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
 import tiktoken
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from skdim.id import MLE, CorrInt, TwoNN
-from collections import defaultdict
+from tqdm import tqdm
 import torch
 import os
 import gc
 
-from config import BATCH_SIZE, SEQ_LEN, DATA_PATH, OUTPUT_PATH
+from config import BATCH_SIZE, SEQ_LEN, DATA_PATH, EMB_PATH
 
-
-# Persistent RNGs for random baselines — one per seed, advancing across samples
-# so each sample gets a different draw while remaining fully reproducible.
-_random_rngs = [np.random.RandomState(seed) for seed in range(10)]
 
 # Holds the full batch embedding from the most recent forward pass.
 # Shape: (batch, seq_len, hidden_dim)
@@ -37,58 +30,25 @@ def get_texts(arr, enc, separators):
     return texts
 
 
-def compute_metrics_for_emb(mat: np.ndarray) -> dict:
-    """Computes all geometry metrics for a single (seq_len, hidden_dim) matrix.
-
-    SVD is performed once and reused across metrics that need singular values.
-    """
-    metrics = {}
-
-    # # ID: MLE
-    # metrics["MLE"] = MLE().fit_transform(mat)
-
-    # ID: CorrInt
-    metrics["CorrInt"] = CorrInt().fit_transform(mat)
-
-    # # ID: TwoNN
-    # metrics["TwoNN"] = TwoNN().fit_transform(mat)
-
-    # Singular values shared by the next two metrics
-    singular_values = np.linalg.svd(mat, compute_uv=False)
-
-    # Schatten norm (nuclear norm = Schatten-1 norm: sum of singular values)
-    metrics["schatten_norm"] = float(np.sum(singular_values))
-
-    # Effective rank: exp(Shannon entropy of normalised singular values)
-    p = singular_values / (singular_values.sum() + 1e-10)
-    entropy = -np.sum(p * np.log(p + 1e-10))
-    metrics["effective_rank"] = float(np.exp(entropy))
-
-    # 10 random (uniform) baselines — each RNG advances its state across samples
-    for seed, rng in enumerate(_random_rngs):
-        metrics[f"random_seed_{seed}"] = float(rng.uniform())
-
-    return metrics
-
-
 def process_shard(arr, enc, eot, tok, model):
-    """Processes one shard with batched GPU inference.
+    """Runs batched inference and returns embeddings + metadata for the shard.
 
-    Texts are grouped into batches of BATCH_SIZE, padded to the longest sequence
-    in the batch, and run through the model in a single forward pass. Per-sample
-    embeddings are extracted from the batch output by trimming padding via the
-    attention mask before computing metrics.
+    Embeddings are stored as float16 (shape: N x SEQ_LEN x hidden_dim).
+    Short texts are zero-padded to SEQ_LEN; seq_lens records the real length.
     """
     global current_batch_embs
     separators = np.where(arr == eot)[0][1:]
     texts = get_texts(arr, enc, separators)
+    n = len(texts)
 
-    results = defaultdict(list)
+    # Lazily allocated once hidden_dim is known from the first batch
+    all_embs = None
+    seq_lens = np.zeros(n, dtype=np.int16)
+    has_enough_tokens = np.zeros(n, dtype=bool)
 
-    for batch_start in tqdm(range(0, len(texts), BATCH_SIZE), desc="Processing batches"):
+    for batch_start in tqdm(range(0, n, BATCH_SIZE), desc="Processing batches"):
         batch_texts = texts[batch_start:batch_start + BATCH_SIZE]
 
-        # Tokenize whole batch at once; pad to the longest sequence in the batch
         inputs = tok(
             batch_texts,
             return_tensors="pt",
@@ -96,31 +56,30 @@ def process_shard(arr, enc, eot, tok, model):
             truncation=True,
             padding=True,         # right-pad to longest in batch
         )
-        # Keep attention_mask on CPU for slicing; move inputs to GPU for inference
         attention_mask = inputs["attention_mask"]  # (batch, seq_len) — CPU
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
         with torch.no_grad():
             model(**inputs)
 
-        # current_batch_embs: (batch, padded_seq_len, hidden_dim) — CPU
-        batch_embs = current_batch_embs
-        current_batch_embs = None  # release reference immediately
+        batch_embs = current_batch_embs  # (batch, padded_len, hidden_dim)
+        current_batch_embs = None
+        hidden_dim = batch_embs.shape[2]
 
-        for i, mask in enumerate(attention_mask):
-            seq_len = int(mask.sum())           # real (non-padded) token count
-            has_enough = seq_len >= SEQ_LEN     # False for texts shorter than SEQ_LEN
-            results["has_enough_tokens"].append(has_enough)
-            mat = batch_embs[i, :seq_len].float().numpy()
-            for key, val in compute_metrics_for_emb(mat).items():
-                results[key].append(val)
+        if all_embs is None:
+            all_embs = np.zeros((n, SEQ_LEN, hidden_dim), dtype=np.float16)
 
-    results["start_idx"] = separators[:-1]
-    results["end_idx"] = separators[1:]
-    return results
+        for j, mask in enumerate(attention_mask):
+            idx = batch_start + j
+            slen = int(mask.sum())
+            seq_lens[idx] = slen
+            has_enough_tokens[idx] = slen >= SEQ_LEN
+            # Cast to float16 for compact storage; real tokens only, rest stays 0
+            all_embs[idx, :slen] = batch_embs[j, :slen].float().numpy().astype(np.float16)
+
+    return all_embs, seq_lens, has_enough_tokens, separators
 
 
-np.random.seed(42)
 device = "cuda:0"
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
 tok.padding_side = "right"  # causal model: right-pad so real tokens are unaffected
@@ -131,12 +90,22 @@ model = model.to(device)
 model = model.eval()
 L = 12
 handle = model.model.layers[L].register_forward_hook(hook_get_embs)
-os.makedirs(OUTPUT_PATH, exist_ok=True)
+os.makedirs(EMB_PATH, exist_ok=True)
+
 for filepath in DATA_PATH.iterdir():
     if filepath.suffix == ".bin":
         print("Processing", filepath.stem)
         arr = np.fromfile(filepath, dtype=np.uint16)
-        metrics = process_shard(arr, enc, eot, tok, model)
+        embs, seq_lens, has_enough_tokens, separators = process_shard(arr, enc, eot, tok, model)
         del arr
         gc.collect()
-        pd.DataFrame(metrics).to_csv(OUTPUT_PATH / f"{filepath.stem}.csv", index=False)
+        np.savez_compressed(
+            EMB_PATH / f"{filepath.stem}.npz",
+            embs=embs,                        # (N, SEQ_LEN, hidden_dim), float16
+            seq_lens=seq_lens,                # (N,), actual token count per sample
+            has_enough_tokens=has_enough_tokens,
+            start_idx=separators[:-1],
+            end_idx=separators[1:],
+        )
+        del embs
+        gc.collect()
