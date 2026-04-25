@@ -23,8 +23,10 @@ current_batch_embs = None
 
 def hook_get_embs(module, inputs, outputs):
     global current_batch_embs
-    # outputs[0]: (batch, seq_len, hidden_dim)
-    current_batch_embs = outputs[0].detach().cpu()
+    # Decoder layers may return a tuple (hidden_states, ...) or the tensor directly.
+    # In both cases we want the 3-D hidden states (batch, seq_len, hidden_dim).
+    hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+    current_batch_embs = hidden_states.detach().cpu()
 
 
 def get_texts(arr, enc, separators):
@@ -37,11 +39,13 @@ def get_texts(arr, enc, separators):
     return texts
 
 
-def process_shard(arr, enc, eot, tok, model):
-    """Runs batched inference and returns embeddings + metadata for the shard.
+def process_shard(arr, enc, eot, tok, model, out_path):
+    """Runs batched inference, saves embeddings to out_path, returns metadata.
 
     Embeddings are stored as float16 (shape: N x SEQ_LEN x hidden_dim).
     Short texts are zero-padded to SEQ_LEN; seq_lens records the real length.
+    all_embs is deleted inside this function right after saving so the caller
+    never holds a second reference to the large array.
     """
     global current_batch_embs
     separators = np.where(arr == eot)[0][1:]
@@ -69,12 +73,8 @@ def process_shard(arr, enc, eot, tok, model):
         with torch.no_grad():
             model(**inputs)
 
-        batch_embs = current_batch_embs  # (batch, padded_len, hidden_dim)
-        current_batch_embs = None
-        hidden_dim = batch_embs.shape[2]
-
         if all_embs is None:
-            all_embs = np.zeros((n, SEQ_LEN, hidden_dim), dtype=np.float16)
+            all_embs = np.zeros((n, SEQ_LEN, current_batch_embs.shape[2]), dtype=np.float16)
 
         for j, mask in enumerate(attention_mask):
             idx = batch_start + j
@@ -82,12 +82,25 @@ def process_shard(arr, enc, eot, tok, model):
             seq_lens[idx] = slen
             has_enough_tokens[idx] = slen >= SEQ_LEN
             # Cast to float16 for compact storage; real tokens only, rest stays 0
-            all_embs[idx, :slen] = batch_embs[j, :slen].float().numpy().astype(np.float16)
+            all_embs[idx, :slen] = current_batch_embs[j, :slen].float().numpy().astype(np.float16)
 
-    return all_embs, seq_lens, has_enough_tokens, separators
+        current_batch_embs = None  # free after all samples in this batch are copied
+
+    # Save and immediately free the large array before returning
+    np.savez_compressed(
+        out_path,
+        embs=all_embs,                    # (N, SEQ_LEN, hidden_dim), float16
+        seq_lens=seq_lens,                # (N,), actual token count per sample
+        has_enough_tokens=has_enough_tokens,
+        start_idx=separators[:-1],
+        end_idx=separators[1:],
+    )
+    del all_embs
+    gc.collect()
 
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
+tok.padding_side = "right"  # causal model: right-pad so real tokens keep correct positions
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B")
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens['<|endoftext|>']
@@ -104,16 +117,7 @@ for filepath in DATA_PATH.iterdir():
             continue
         print("Processing", filepath.stem)
         arr = np.fromfile(filepath, dtype=np.uint16)
-        embs, seq_lens, has_enough_tokens, separators = process_shard(arr, enc, eot, tok, model)
+        out_path = EMB_PATH / f"{filepath.stem}.npz"
+        process_shard(arr, enc, eot, tok, model, out_path)
         del arr
-        gc.collect()
-        np.savez_compressed(
-            EMB_PATH / f"{filepath.stem}.npz",
-            embs=embs,                        # (N, SEQ_LEN, hidden_dim), float16
-            seq_lens=seq_lens,                # (N,), actual token count per sample
-            has_enough_tokens=has_enough_tokens,
-            start_idx=separators[:-1],
-            end_idx=separators[1:],
-        )
-        del embs
         gc.collect()
