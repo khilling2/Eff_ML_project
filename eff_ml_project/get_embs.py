@@ -44,14 +44,14 @@ def compute_metrics_for_emb(mat: np.ndarray) -> dict:
     """
     metrics = {}
 
-    # ID: MLE
-    metrics["MLE"] = MLE().fit_transform(mat)
+    # # ID: MLE
+    # metrics["MLE"] = MLE().fit_transform(mat)
 
     # ID: CorrInt
     metrics["CorrInt"] = CorrInt().fit_transform(mat)
 
-    # ID: TwoNN
-    metrics["TwoNN"] = TwoNN().fit_transform(mat)
+    # # ID: TwoNN
+    # metrics["TwoNN"] = TwoNN().fit_transform(mat)
 
     # Singular values shared by the next two metrics
     singular_values = np.linalg.svd(mat, compute_uv=False)
