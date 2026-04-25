@@ -7,7 +7,14 @@ import torch
 import os
 import gc
 
-from config import BATCH_SIZE, SEQ_LEN, DATA_PATH, EMB_PATH
+from config import (
+    BATCH_SIZE,
+    SEQ_LEN,
+    DATA_PATH, 
+    EMB_PATH,
+    DEVICE,
+    LAYER
+)
 
 
 # Holds the full batch embedding from the most recent forward pass.
@@ -57,7 +64,7 @@ def process_shard(arr, enc, eot, tok, model):
             padding=True,         # right-pad to longest in batch
         )
         attention_mask = inputs["attention_mask"]  # (batch, seq_len) — CPU
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
         with torch.no_grad():
             model(**inputs)
@@ -80,20 +87,21 @@ def process_shard(arr, enc, eot, tok, model):
     return all_embs, seq_lens, has_enough_tokens, separators
 
 
-device = "cuda:0"
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
-tok.padding_side = "right"  # causal model: right-pad so real tokens are unaffected
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B")
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens['<|endoftext|>']
-model = model.to(device)
+model = model.to(DEVICE)
 model = model.eval()
-L = 12
-handle = model.model.layers[L].register_forward_hook(hook_get_embs)
+handle = model.model.layers[LAYER].register_forward_hook(hook_get_embs)
 os.makedirs(EMB_PATH, exist_ok=True)
 
+i = 0
 for filepath in DATA_PATH.iterdir():
     if filepath.suffix == ".bin":
+        i += 1
+        if i <= 5:
+            continue
         print("Processing", filepath.stem)
         arr = np.fromfile(filepath, dtype=np.uint16)
         embs, seq_lens, has_enough_tokens, separators = process_shard(arr, enc, eot, tok, model)
