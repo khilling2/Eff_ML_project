@@ -4,7 +4,7 @@ import pandas as pd
 from tqdm import tqdm
 import tiktoken
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from skdim.id import MLE
+from skdim.id import MLE, CorrInt, TwoNN
 from collections import defaultdict
 import torch
 import os
@@ -39,10 +39,45 @@ def count_geometry_metrics():
         mle_metric.append(metric)
     results["MLE"] = np.array(mle_metric)
 
-    # random (uniform)
-    results["random"] = np.random.uniform(size=len(saved_embs))
+    # ID: CorrInt
+    corrint_metric = []
+    for embs in saved_embs:
+        estimator = CorrInt()
+        metric = estimator.fit_predict(embs[0])
+        corrint_metric.append(metric)
+    results["CorrInt"] = np.array(corrint_metric)
 
-    #TODO add other metrics
+    # ID: TwoNN
+    twonn_metric = []
+    for embs in saved_embs:
+        estimator = TwoNN()
+        metric = estimator.fit_predict(embs[0])
+        twonn_metric.append(metric)
+    results["TwoNN"] = np.array(twonn_metric)
+
+    # Schatten norm (nuclear norm = Schatten-1 norm: sum of singular values)
+    schatten_metric = []
+    for embs in saved_embs:
+        mat = embs[0].float().numpy()
+        singular_values = np.linalg.svd(mat, compute_uv=False)
+        schatten_metric.append(np.sum(singular_values))
+    results["schatten_norm"] = np.array(schatten_metric)
+
+    # Effective rank: exp(Shannon entropy of normalised singular values)
+    eff_rank_metric = []
+    for embs in saved_embs:
+        mat = embs[0].float().numpy()
+        singular_values = np.linalg.svd(mat, compute_uv=False)
+        p = singular_values / (singular_values.sum() + 1e-10)
+        entropy = -np.sum(p * np.log(p + 1e-10))
+        eff_rank_metric.append(np.exp(entropy))
+    results["effective_rank"] = np.array(eff_rank_metric)
+
+    # 10 random (uniform) baselines with different seeds
+    for seed in range(10):
+        rng = np.random.RandomState(seed)
+        results[f"random_seed_{seed}"] = rng.uniform(size=len(saved_embs))
+
     return results
 
 
