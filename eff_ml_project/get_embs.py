@@ -10,17 +10,16 @@ import torch
 import os
 import gc
 
+from config import BATCH_SIZE, SEQ_LEN, DATA_PATH, OUTPUT_PATH
 
-BATCH_SIZE = 32  # number of texts per forward pass; tune to GPU VRAM
-SEQ_LEN = 300    # texts are cropped to this many tokens; shorter ones are flagged
 
 # Persistent RNGs for random baselines — one per seed, advancing across samples
 # so each sample gets a different draw while remaining fully reproducible.
 _random_rngs = [np.random.RandomState(seed) for seed in range(10)]
 
 # Holds the full batch embedding from the most recent forward pass.
-# Shape: (batch, seq_len, hidden_dim) — overwritten every batch, never accumulated.
-current_batch_embs: torch.Tensor | None = None
+# Shape: (batch, seq_len, hidden_dim)
+current_batch_embs = None
 
 def hook_get_embs(module, inputs, outputs):
     global current_batch_embs
@@ -46,13 +45,13 @@ def compute_metrics_for_emb(mat: np.ndarray) -> dict:
     metrics = {}
 
     # ID: MLE
-    metrics["MLE"] = MLE().fit_predict(mat)
+    metrics["MLE"] = MLE().fit_transform(mat)
 
     # ID: CorrInt
-    metrics["CorrInt"] = CorrInt().fit_predict(mat)
+    metrics["CorrInt"] = CorrInt().fit_transform(mat)
 
     # ID: TwoNN
-    metrics["TwoNN"] = TwoNN().fit_predict(mat)
+    metrics["TwoNN"] = TwoNN().fit_transform(mat)
 
     # Singular values shared by the next two metrics
     singular_values = np.linalg.svd(mat, compute_uv=False)
@@ -132,12 +131,12 @@ model = model.to(device)
 model = model.eval()
 L = 12
 handle = model.model.layers[L].register_forward_hook(hook_get_embs)
-os.makedirs("metrics", exist_ok=True)
-for filepath in Path("fineweb10B").iterdir():
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+for filepath in DATA_PATH.iterdir():
     if filepath.suffix == ".bin":
         print("Processing", filepath.stem)
         arr = np.fromfile(filepath, dtype=np.uint16)
         metrics = process_shard(arr, enc, eot, tok, model)
         del arr
         gc.collect()
-        pd.DataFrame(metrics).to_csv(f"metrics/{filepath.stem}.csv", index=False)
+        pd.DataFrame(metrics).to_csv(OUTPUT_PATH / f"{filepath.stem}.csv", index=False)
