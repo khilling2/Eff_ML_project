@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
+import os
 from torch import Tensor
 import torch.distributed as dist
 from datasets import load_dataset
@@ -192,4 +193,4 @@ def evaluate(model, schedule_cfg, seq_len: int, get_bigram_hash: Callable, print
     torch.cuda.synchronize()
     seconds = time.perf_counter() - t0
     print0(f"HellaSwag: {accuracy=:.3%} ({n_correct=} out of {n_count=} tasks in {seconds=:.2f})", console=True)
-    print0(f"{accuracy:.3},{n_correct},{n_count}", bench=True)
+    print0(f"{os.environ['EXP_NAME']},{accuracy:.3},{n_correct},{n_count}", bench=True)

@@ -8,6 +8,7 @@ from skdim.id import MLE
 from collections import defaultdict
 import torch
 import os
+import gc
 
 
 saved_embs = []
@@ -65,7 +66,8 @@ def process_shard(arr, enc, eot, tok, model):
     return results
 
 
-device = "cuda:1"
+np.random.seed(42)
+device = "cuda:0"
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B")
 enc = tiktoken.get_encoding("gpt2")
@@ -74,18 +76,17 @@ model = model.to(device)
 model = model.eval()
 L = 12
 handle = model.model.layers[L].register_forward_hook(hook_get_embs)
-
+# TODO why crashes at the second iteration
 os.makedirs("metrics", exist_ok=True)
 i = 0
 for filepath in Path("fineweb10B").iterdir():
     if filepath.suffix == ".bin":
         i += 1
-        if i >= 6:
+        if i == 10:
             print("Processing", filepath.stem)
             arr = np.fromfile(filepath, dtype=np.uint16)
             metrics = process_shard(arr, enc, eot, tok, model)
-            saved_embs.clear()
+            del saved_embs[:]
             del arr
+            gc.collect()
             pd.DataFrame(metrics).to_csv(f"metrics/{filepath.stem}.csv", index=False)
-
-
