@@ -12,6 +12,7 @@ import gc
 
 
 BATCH_SIZE = 32  # number of texts per forward pass; tune to GPU VRAM
+SEQ_LEN = 300    # texts are cropped to this many tokens; shorter ones are flagged
 
 # Persistent RNGs for random baselines — one per seed, advancing across samples
 # so each sample gets a different draw while remaining fully reproducible.
@@ -92,7 +93,7 @@ def process_shard(arr, enc, eot, tok, model):
         inputs = tok(
             batch_texts,
             return_tensors="pt",
-            max_length=1024,
+            max_length=SEQ_LEN,
             truncation=True,
             padding=True,         # right-pad to longest in batch
         )
@@ -109,6 +110,8 @@ def process_shard(arr, enc, eot, tok, model):
 
         for i, mask in enumerate(attention_mask):
             seq_len = int(mask.sum())           # real (non-padded) token count
+            has_enough = seq_len >= SEQ_LEN     # False for texts shorter than SEQ_LEN
+            results["has_enough_tokens"].append(has_enough)
             mat = batch_embs[i, :seq_len].float().numpy()
             for key, val in compute_metrics_for_emb(mat).items():
                 results[key].append(val)
