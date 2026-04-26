@@ -113,7 +113,7 @@ i = 0
 for filepath in DATA_PATH.iterdir():
     if filepath.suffix == ".bin":
         i += 1
-        if i <= 5:
+        if i > 5:
             continue
         print("Processing", filepath.stem)
         arr = np.fromfile(filepath, dtype=np.uint16)
