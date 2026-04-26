@@ -1479,10 +1479,12 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
 
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
-    tokens = _load_data_shard(next(file_iter))
+    current_file = next(file_iter)
+    tokens = _load_data_shard(current_file)
     if align_to_bos:
         shard = Shard(tokens, world_size)
-        next_shard_getter = Shard.load_async(next(file_iter), world_size)
+        _next_file = next(file_iter)
+        next_shard_getter = Shard.load_async(_next_file, world_size)
     else:
         pos = 0  # for unaligned case
 
@@ -1496,12 +1498,15 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                 start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
             except StopIteration:
                 # This shard is exhausted, load the next one in the next loop iteration.
+                current_file = _next_file
                 shard = next_shard_getter()
                 tokens = shard.tokens
                 try:
-                    next_shard_getter = Shard.load_async(next(file_iter), world_size)
+                    _next_file = next(file_iter)
+                    next_shard_getter = Shard.load_async(_next_file, world_size)
                 except StopIteration:
                     next_shard_getter = None  # no more shards to preload
+                    _next_file = None
                 continue
 
             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
@@ -1512,7 +1517,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
         else:
             if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
-                tokens, pos = _load_data_shard(next(file_iter)), 0
+                current_file = next(file_iter)
+                tokens, pos = _load_data_shard(current_file), 0
 
             pos_local = pos + rank * num_tokens_local
             buf = tokens[pos_local: pos_local + num_tokens_local + 1]
@@ -1539,6 +1545,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _cum_lengths.to(device="cuda", non_blocking=True),
             _bigram_inputs.to(device="cuda", non_blocking=True),
             _bigram_inputs.numpy(),
+            current_file.name,
         )
 
         if new_params is not None:
@@ -1934,12 +1941,12 @@ for step in warmup_steps:
     training_manager.advance_schedule(step)
     model.eval()
     with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+        inputs, targets, cum_seqlens, bigram_inputs, _, _ = next(val_loader)
         model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
     model.train()
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, _ = train_loader.send(send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
         loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
         training_manager.sparse_index_share(step)
@@ -1969,6 +1976,9 @@ train_steps = training_schedule.total_steps
 step = 0
 should_break = False
 last_step = False
+_shard_name = None     # filename of the shard currently being accumulated
+_shard_loss_sum = 0.0  # sum of per-token losses for the current shard
+_shard_token_count = 0 # number of tokens seen for the current shard
 while True:
     # last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -1986,7 +1996,7 @@ while True:
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                inputs, targets, cum_seqlens, bigram_inputs, _, _ = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
         val_loss /= val_steps
         del val_loader
@@ -2009,9 +2019,19 @@ while True:
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         try:
-            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, shard_name = train_loader.send(training_manager.train_loader_send_args)
+            if shard_name != _shard_name:
+                if _shard_name is not None:
+                    print0(f"shard,{_shard_name},{_shard_loss_sum / max(_shard_token_count, 1):.4f}", loss=True)
+                _shard_name = shard_name
+                _shard_loss_sum = 0.0
+                _shard_token_count = 0
             training_manager.sparse_index_update(step, bigram_cpu)
-            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+            loss_per_token = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+            _shard_loss_sum += loss_per_token.detach().sum().item()
+            _shard_token_count += loss_per_token.numel()
+            loss = loss_per_token.sum() * grad_scale
+            del loss_per_token
             training_manager.sparse_index_share(step)
             loss.backward()
             del loss
@@ -2027,6 +2047,10 @@ while True:
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
     step += 1
+
+# Flush the last shard's accumulated loss (no next-shard transition will trigger it)
+if _shard_name is not None and _shard_token_count > 0:
+    print0(f"shard,{_shard_name},{_shard_loss_sum / _shard_token_count:.4f}", loss=True)
 
 if args.run_evals:
     model.eval()

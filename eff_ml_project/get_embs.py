@@ -1,17 +1,28 @@
 from pathlib import Path
+import os
+# Set BEFORE any numpy/scipy/sklearn import so BLAS thread pools initialise
+# with 1 thread. With 16 forked workers, unconstrained BLAS gives
+# 16 × N_CPU threads competing → extreme slowdown (minutes per sample).
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+# Must be set before the tokenizers library initialises its Rust thread pool.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import numpy as np
 import pandas as pd
 import tiktoken
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from scipy.linalg import svd as scipy_svd
 from skdim.id import MLE, CorrInt, TwoNN
+from threadpoolctl import threadpool_limits
 from collections import defaultdict
 from tqdm import tqdm
 import torch
 import multiprocessing as mp
-import os
 import gc
 
-from config import BATCH_SIZE, SEQ_LEN, N_WORKERS, DATA_PATH, OUTPUT_PATH, DEVICE, LAYER
+from config import BATCH_SIZE, SEQ_LEN, N_WORKERS, PCA_COMPONENTS, FINEWEB_PATH, METRICS_PATH, DEVICE, LAYER
 
 
 # Persistent RNGs for random baselines — one per seed, advancing across samples.
@@ -47,33 +58,49 @@ def get_texts(arr, enc, separators):
 # ── metric helpers (module-level so they are picklable / visible after fork) ──
 
 def _compute_metrics_no_random(mat: np.ndarray) -> dict:
-    """All geometry metrics except random baselines (handled in main process)."""
+    """All geometry metrics except random baselines (handled in main process).
+
+    Args:
+        mat: float32 array of shape (seq_len, hidden_dim) — the token embeddings
+             for one text, where seq_len <= SEQ_LEN and hidden_dim is the model's
+             hidden size (e.g. 896 for Qwen2-0.5B).
+
+    SVD is computed once and reused:
+      - singular values  → schatten norm, effective rank
+      - U * s[:k]        → PCA-projected point cloud (896 → PCA_COMPONENTS dims)
+                           fed to ID estimators for ~17× faster NN search
+    """
+    # full_matrices=False: U (n_tokens, r), s (r,), Vt (r, hidden) where r = min(n_tokens, hidden)
+    # check_finite=False: skip input validation for speed
+    U, s, _ = scipy_svd(mat, full_matrices=False, check_finite=False)
+
+    # Schatten norm and effective rank use all singular values
     metrics = {}
-    metrics["MLE"] = MLE().fit_transform(mat)
-    metrics["CorrInt"] = CorrInt().fit_transform(mat)
-    metrics["TwoNN"] = TwoNN().fit_transform(mat)
-    singular_values = np.linalg.svd(mat, compute_uv=False)
-    metrics["schatten_norm"] = float(np.sum(singular_values))
-    p = singular_values / (singular_values.sum() + 1e-10)
-    entropy = -np.sum(p * np.log(p + 1e-10))
-    metrics["effective_rank"] = float(np.exp(entropy))
+    metrics["schatten_norm"] = float(s.sum())
+    p = s / (s.sum() + 1e-10)
+    metrics["effective_rank"] = float(np.exp(-np.sum(p * np.log(p + 1e-10))))
+
+    # Project to top-PCA_COMPONENTS dims: U[:, :k] * s[:k]  ≡  mat @ Vt[:k].T
+    # ID estimators work on the reduced cloud — NN search is O(n^2 * k) not O(n^2 * 896)
+    k = min(PCA_COMPONENTS, U.shape[1])
+    mat_reduced = U[:, :k] * s[:k]  # (n_tokens, k)
+
+    metrics["MLE"] = MLE().fit_transform(mat_reduced)
+    metrics["CorrInt"] = CorrInt().fit_transform(mat_reduced)
+    metrics["TwoNN"] = TwoNN().fit_transform(mat_reduced)
+
     return metrics
 
 
-def _worker_fn(args):
-    """Compute metrics for a chunk of sample indices.
-
-    _all_embs_for_workers is inherited from the parent process via fork
-    (copy-on-write; no data is copied since workers only read).
-    """
-    # Limit BLAS/OpenMP threads to 1 per worker; we parallelize at the process level.
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    indices, seq_lens = args
-    return [
-        _compute_metrics_no_random(_all_embs_for_workers[i, :slen].astype(np.float32))
-        for i, slen in zip(indices, seq_lens)
-    ]
+def _worker_single(args):
+    """Compute metrics for one sample. Called by pool.imap — inherits
+    _all_embs_for_workers from the parent via fork (copy-on-write, read-only)."""
+    i, slen = args
+    mat = _all_embs_for_workers[i, :slen].astype(np.float32)
+    # Belt-and-suspenders: threadpoolctl works at the BLAS API level and
+    # takes effect even if the thread pool was already initialised.
+    with threadpool_limits(limits=1):
+        return _compute_metrics_no_random(mat)
 
 
 def process_shard(arr, enc, eot, tok, model):
@@ -125,25 +152,21 @@ def process_shard(arr, enc, eot, tok, model):
     _all_embs_for_workers = all_embs
     del all_embs
 
-    chunks = np.array_split(np.arange(n), N_WORKERS)
-    worker_args = [(chunk.tolist(), seq_lens[chunk].tolist()) for chunk in chunks]
+    # chunksize: number of samples sent to a worker in one IPC message.
+    # Smaller = smoother tqdm; larger = less IPC overhead. 256 is a good balance.
+    chunksize = max(1, n // (N_WORKERS * 16))
+    sample_args = [(i, int(seq_lens[i])) for i in range(n)]
 
     ctx = mp.get_context("fork")  # fork: workers inherit _all_embs_for_workers cheaply
     with ctx.Pool(N_WORKERS) as pool:
-        chunk_results = list(tqdm(
-            pool.imap(_worker_fn, worker_args),
-            total=N_WORKERS, desc="Metrics (parallel)",
+        # imap preserves order → metrics_list[i] corresponds to sample i
+        metrics_list = list(tqdm(
+            pool.imap(_worker_single, sample_args, chunksize=chunksize),
+            total=n, desc="Metrics",
         ))
 
     _all_embs_for_workers = None
     gc.collect()
-
-    # Reassemble results in original sample order.
-    # Use int() to ensure Python-int keys regardless of numpy scalar type.
-    ordered = {}
-    for chunk_indices, chunk_res in zip(chunks, chunk_results):
-        for i, m in zip(chunk_indices, chunk_res):
-            ordered[int(i)] = m
 
     results = defaultdict(list)
     results["has_enough_tokens"] = has_enough_tokens.tolist()
@@ -151,8 +174,8 @@ def process_shard(arr, enc, eot, tok, model):
     results["end_idx"] = separators[1:].tolist()
     for seed in range(10):
         results[f"random_seed_{seed}"] = random_draws[seed].tolist()
-    for key in ordered[0]:
-        results[key] = [ordered[i][key] for i in range(n)]
+    for key in metrics_list[0]:
+        results[key] = [m[key] for m in metrics_list]
 
     return results
 
@@ -166,15 +189,15 @@ if __name__ == "__main__":
     model = model.to(DEVICE)
     model = model.eval()
     handle = model.model.layers[LAYER].register_forward_hook(hook_get_embs)
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
+    os.makedirs(METRICS_PATH, exist_ok=True)
 
     i = 0
-    for filepath in DATA_PATH.iterdir():
+    for filepath in FINEWEB_PATH.iterdir():
         if filepath.suffix == ".bin":
             i += 1
             if i > 5:
                 continue
-            csv_path = OUTPUT_PATH / f"{filepath.stem}.csv"
+            csv_path = METRICS_PATH / f"{filepath.stem}.csv"
             if csv_path.exists():
                 print(f"Skipping {filepath.stem} (already done)")
                 continue
