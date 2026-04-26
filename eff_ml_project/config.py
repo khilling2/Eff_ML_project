@@ -3,6 +3,7 @@ from pathlib import Path
 
 BATCH_SIZE = 128
 SEQ_LEN = 300
+N_WORKERS = 16
 DATA_PATH = Path("data/fineweb10B")
 EMB_PATH = Path("data/embs")       # compressed npz files from get_embs.py
 OUTPUT_PATH = Path("data/metrics") # CSV files from calc_metrics.py
