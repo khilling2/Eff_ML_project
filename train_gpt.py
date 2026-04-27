@@ -1977,8 +1977,22 @@ step = 0
 should_break = False
 last_step = False
 _shard_name = None     # filename of the shard currently being accumulated
-_shard_loss_sum = 0.0  # sum of per-token losses for the current shard
-_shard_token_count = 0 # number of tokens seen for the current shard
+
+def compute_val_loss():
+    """Run evaluation on the test set and return the average val loss."""
+    assert args.val_tokens % args.val_batch_size == 0
+    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    val_loss = 0
+    with torch.no_grad():
+        for _ in range(val_steps):
+            inputs, targets, cum_seqlens, bigram_inputs, _, _ = next(val_loader)
+            val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+    val_loss /= val_steps
+    del val_loader
+    dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+    return val_loss
+
 while True:
     # last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -1990,17 +2004,7 @@ while True:
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-        val_loss /= val_steps
-        del val_loader
-        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        val_loss = compute_val_loss()
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         print0(f"{step},{val_loss:.4f}", loss=True)
         model.train()
@@ -2022,14 +2026,17 @@ while True:
             inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu, shard_name = train_loader.send(training_manager.train_loader_send_args)
             if shard_name != _shard_name:
                 if _shard_name is not None:
-                    print0(f"shard,{_shard_name},{_shard_loss_sum / max(_shard_token_count, 1):.4f}", loss=True)
+                    torch.cuda.synchronize()
+                    training_time_ms += 1000 * (time.perf_counter() - t0)
+                    model.eval()
+                    val_loss = compute_val_loss()
+                    print0(f"shard,{_shard_name},{val_loss:.4f}", loss=True)
+                    model.train()
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
                 _shard_name = shard_name
-                _shard_loss_sum = 0.0
-                _shard_token_count = 0
             training_manager.sparse_index_update(step, bigram_cpu)
             loss_per_token = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-            _shard_loss_sum += loss_per_token.detach().sum().item()
-            _shard_token_count += loss_per_token.numel()
             loss = loss_per_token.sum() * grad_scale
             del loss_per_token
             training_manager.sparse_index_share(step)
@@ -2048,9 +2055,12 @@ while True:
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
     step += 1
 
-# Flush the last shard's accumulated loss (no next-shard transition will trigger it)
-if _shard_name is not None and _shard_token_count > 0:
-    print0(f"shard,{_shard_name},{_shard_loss_sum / _shard_token_count:.4f}", loss=True)
+# Evaluate on test set after the last shard (no next-shard transition will trigger it)
+if _shard_name is not None:
+    model.eval()
+    val_loss = compute_val_loss()
+    print0(f"shard,{_shard_name},{val_loss:.4f}", loss=True)
+    model.train()
 
 if args.run_evals:
     model.eval()
