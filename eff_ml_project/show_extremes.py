@@ -16,6 +16,7 @@ import tiktoken
 from tqdm import tqdm
 
 from config import METRICS_PATH, FINEWEB_PATH, METRIC_COLUMNS
+from utils import load_all_metrics, preload_shards, decode_sample
 
 # ── output destination ────────────────────────────────────────────────────
 OUTPUT = open(Path(__file__).parent / "extremes.csv", "w")
@@ -28,43 +29,6 @@ NON_RANDOM_METRICS = [m for m in METRIC_COLUMNS if not m.startswith("random_seed
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-def load_all_metrics(metrics_path: Path) -> pd.DataFrame:
-    """Concatenate every per-shard metrics CSV into a single DataFrame."""
-    csv_files = sorted(
-        fp for fp in metrics_path.iterdir() if fp.name.startswith("fineweb_train")
-    )
-    if not csv_files:
-        raise FileNotFoundError(f"No metric CSV files found in {metrics_path}")
-
-    print(f"Found {len(csv_files)} shard metric file(s) in {metrics_path}", file=OUTPUT)
-    dfs = []
-    for fp in tqdm(csv_files, desc="Loading metric CSVs"):
-        df = pd.read_csv(fp)
-        df["shard_stem"] = fp.stem
-        dfs.append(df)
-
-    combined = pd.concat(dfs, ignore_index=True)
-    print(f"Total rows: {len(combined):,}", file=OUTPUT)
-    return combined
-
-
-def preload_shards(stems: list[str], fineweb_path: Path) -> dict[str, np.ndarray]:
-    """Load each unique shard .bin file into memory once."""
-    unique_stems = sorted(set(stems))
-    cache: dict[str, np.ndarray] = {}
-    for stem in tqdm(unique_stems, desc="Loading shard .bin files"):
-        cache[stem] = np.fromfile(fineweb_path / (stem + ".bin"), dtype=np.uint16)
-    return cache
-
-
-def decode_sample(row: pd.Series, shard_cache: dict[str, np.ndarray], enc) -> str:
-    """Decode a single text sample from its token range."""
-    arr = shard_cache[row["shard_stem"]]
-    # start_idx points to the EOT token; actual text starts one token later
-    tokens = arr[int(row["start_idx"]) + 1 : int(row["end_idx"])]
-    return enc.decode(tokens.tolist())
-
 
 def print_examples(metric: str, df: pd.DataFrame, shard_cache: dict, enc) -> None:
     """Print the top-N and bottom-N examples for one metric."""
@@ -106,7 +70,7 @@ def print_examples(metric: str, df: pd.DataFrame, shard_cache: dict, enc) -> Non
 def main() -> None:
     enc = tiktoken.get_encoding("gpt2")
 
-    all_df = load_all_metrics(METRICS_PATH)
+    all_df = load_all_metrics(METRICS_PATH, output=OUTPUT)
 
     # Only keep rows where the model had enough tokens for meaningful metrics
     before = len(all_df)
