@@ -98,7 +98,7 @@ def main() -> None:
         needed_stems += s.head(N_EXTREMES)["shard_stem"].tolist()
     shard_cache = preload_shards(needed_stems, FINEWEB_PATH)
 
-    for metric in NON_RANDOM_METRICS:
+    for metric in tqdm(NON_RANDOM_METRICS, desc="Metrics"):
         sorted_asc = all_df.sort_values(metric, ascending=True, ignore_index=True)
         subsets = [
             ("best",  sorted_asc.tail(N_EXTREMES).iloc[::-1].reset_index(drop=True)),
