@@ -7,6 +7,7 @@ prints the texts to stdout.
 Random-baseline columns (random_seed_*) are intentionally skipped.
 """
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,8 +17,11 @@ from tqdm import tqdm
 
 from config import METRICS_PATH, FINEWEB_PATH, METRIC_COLUMNS
 
+# ── output destination ────────────────────────────────────────────────────
+OUTPUT = open(Path(__file__).parent / "extremes.csv", "w")
+
 # ── constants ──────────────────────────────────────────────────────────────
-N_EXAMPLES = 3
+N_EXAMPLES = 20
 TEXT_PREVIEW_CHARS = 600  # truncate very long texts in the printout
 
 NON_RANDOM_METRICS = [m for m in METRIC_COLUMNS if not m.startswith("random_seed_")]
@@ -33,7 +37,7 @@ def load_all_metrics(metrics_path: Path) -> pd.DataFrame:
     if not csv_files:
         raise FileNotFoundError(f"No metric CSV files found in {metrics_path}")
 
-    print(f"Found {len(csv_files)} shard metric file(s) in {metrics_path}")
+    print(f"Found {len(csv_files)} shard metric file(s) in {metrics_path}", file=OUTPUT)
     dfs = []
     for fp in tqdm(csv_files, desc="Loading metric CSVs"):
         df = pd.read_csv(fp)
@@ -41,7 +45,7 @@ def load_all_metrics(metrics_path: Path) -> pd.DataFrame:
         dfs.append(df)
 
     combined = pd.concat(dfs, ignore_index=True)
-    print(f"Total rows: {len(combined):,}")
+    print(f"Total rows: {len(combined):,}", file=OUTPUT)
     return combined
 
 
@@ -68,33 +72,33 @@ def print_examples(metric: str, df: pd.DataFrame, shard_cache: dict, enc) -> Non
 
     sorted_asc = df.sort_values(metric, ascending=True, ignore_index=True)
 
-    print(f"\n{separator}")
-    print(f"  METRIC: {metric}")
-    print(separator)
+    print(f"\n{separator}", file=OUTPUT)
+    print(f"  METRIC: {metric}", file=OUTPUT)
+    print(separator, file=OUTPUT)
 
     # ── highest values ──────────────────────────────────────────────────
-    print(f"\n  >>> TOP {N_EXAMPLES} (highest {metric}) <<<\n")
+    print(f"\n  >>> TOP {N_EXAMPLES} (highest {metric}) <<<\n", file=OUTPUT)
     top_rows = sorted_asc.tail(N_EXAMPLES).iloc[::-1].reset_index(drop=True)
     for rank, (_, row) in enumerate(top_rows.iterrows(), start=1):
         text = decode_sample(row, shard_cache, enc)
         preview = text[:TEXT_PREVIEW_CHARS] + ("…" if len(text) > TEXT_PREVIEW_CHARS else "")
-        print(f"  [{rank}]  {metric} = {row[metric]:.4f}")
-        print(f"       shard={row['shard_stem']}  tokens=[{int(row['start_idx'])},{int(row['end_idx'])})")
-        print()
-        print(preview)
-        print()
+        print(f"  [{rank}]  {metric} = {row[metric]:.4f}", file=OUTPUT)
+        print(f"       shard={row['shard_stem']}  tokens=[{int(row['start_idx'])},{int(row['end_idx'])})", file=OUTPUT)
+        print(file=OUTPUT)
+        print(preview, file=OUTPUT)
+        print(file=OUTPUT)
 
     # ── lowest values ───────────────────────────────────────────────────
-    print(f"  >>> BOTTOM {N_EXAMPLES} (lowest {metric}) <<<\n")
+    print(f"  >>> BOTTOM {N_EXAMPLES} (lowest {metric}) <<<\n", file=OUTPUT)
     bot_rows = sorted_asc.head(N_EXAMPLES).reset_index(drop=True)
     for rank, (_, row) in enumerate(bot_rows.iterrows(), start=1):
         text = decode_sample(row, shard_cache, enc)
         preview = text[:TEXT_PREVIEW_CHARS] + ("…" if len(text) > TEXT_PREVIEW_CHARS else "")
-        print(f"  [{rank}]  {metric} = {row[metric]:.4f}")
-        print(f"       shard={row['shard_stem']}  tokens=[{int(row['start_idx'])},{int(row['end_idx'])})")
-        print()
-        print(preview)
-        print()
+        print(f"  [{rank}]  {metric} = {row[metric]:.4f}", file=OUTPUT)
+        print(f"       shard={row['shard_stem']}  tokens=[{int(row['start_idx'])},{int(row['end_idx'])})", file=OUTPUT)
+        print(file=OUTPUT)
+        print(preview, file=OUTPUT)
+        print(file=OUTPUT)
 
 
 # ── main ───────────────────────────────────────────────────────────────────
@@ -107,14 +111,14 @@ def main() -> None:
     # Only keep rows where the model had enough tokens for meaningful metrics
     before = len(all_df)
     all_df = all_df[all_df["has_enough_tokens"]].reset_index(drop=True)
-    print(f"Dropped {before - len(all_df):,} rows missing enough tokens  ->  {len(all_df):,} remaining")
+    print(f"Dropped {before - len(all_df):,} rows missing enough tokens  ->  {len(all_df):,} remaining", file=OUTPUT)
 
     shard_cache = preload_shards(all_df["shard_stem"].tolist(), FINEWEB_PATH)
 
     for metric in NON_RANDOM_METRICS:
         print_examples(metric, all_df, shard_cache, enc)
 
-    print("\nDone.")
+    print("\nDone.", file=OUTPUT)
 
 
 if __name__ == "__main__":
